@@ -1175,9 +1175,20 @@
                 Configure the Modbus Slave ID and Coils Address for the external 4-Channel Relay.
             </p>
             
-            <div class="config-row">
-                <label>Target Slave Node ID</label>
-                <input type="number" id="relay4chNode" placeholder="2" value="2" min="1" max="247">
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
+                <div class="config-row">
+                    <label>Target Slave Node ID</label>
+                    <input type="number" id="relay4chNode" placeholder="2" value="2" min="1" max="247">
+                </div>
+                <div class="config-row">
+                    <label>Baud Rate</label>
+                    <select id="relay4chBaud" style="width:100%; padding:9px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; color:var(--text-primary); font-size:13px;">
+                        <option value="4800">4800</option>
+                        <option value="9600" selected>9600</option>
+                        <option value="19200">19200</option>
+                        <option value="38400">38400</option>
+                    </select>
+                </div>
             </div>
 
             <div style="margin-top: 14px; padding-top:14px; border-top:1px solid var(--border);">
@@ -1198,21 +1209,46 @@
     <div class="modal-overlay" id="wifiModal">
         <div class="modal">
             <button class="modal-close" onclick="closeWifiModal()">&times;</button>
-            <h3>ESP32 WiFi Setup</h3>
+            <h3>WiFi Configuration</h3>
             <p style="font-size:11px; color:var(--text-secondary); text-align:center; margin-bottom:14px;">
-                Configure the WiFi network for ESP32
+                Set up local internet access for ESP32
             </p>
             <div class="config-row">
-                <label>WiFi SSID</label>
-                <input type="text" id="wifiSsidInput" placeholder="My Home Network">
+                <label>SSID (Network Name)</label>
+                <input type="text" id="wifiSsidInput" placeholder="MyHomeNetwork">
             </div>
             <div class="config-row">
                 <label>Password</label>
-                <input type="password" id="wifiPassInput" placeholder="secret123">
+                <input type="password" id="wifiPassInput" placeholder="••••••••">
             </div>
-            <button class="btn-connect" onclick="saveWifiSettings()"
-                style="margin-top:16px; background:linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));">Send
-                to ESP32</button>
+            <button class="btn-connect" onclick="saveWifiSettings()" style="margin-top:16px;">Update WiFi</button>
+        </div>
+    </div>
+
+    <!-- Schedule Modal -->
+    <div class="modal-overlay" id="scheduleModal">
+        <div class="modal">
+            <button class="modal-close" onclick="closeScheduleModal()">&times;</button>
+            <h3 id="scheduleModalTitle">Timer Schedule</h3>
+            <div class="config-row" style="margin-top:10px; display:flex; gap:10px; align-items:center;">
+                <label style="display:flex; align-items:center; gap:10px; font-size:13px; color:var(--text-primary); cursor:pointer;">
+                    <label class="switch">
+                        <input type="checkbox" id="scheduleEnableCheck">
+                        <span class="slider"></span>
+                    </label>
+                    Enable Auto ON/OFF (NTP)
+                </label>
+            </div>
+            <div class="config-row" style="margin-top: 15px;">
+                <label>Auto ON Time</label>
+                <input type="time" id="scheduleOnTime" style="width:100%; padding:9px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; color:var(--text-primary);">
+            </div>
+            <div class="config-row">
+                <label>Auto OFF Time</label>
+                <input type="time" id="scheduleOffTime" style="width:100%; padding:9px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; color:var(--text-primary);">
+            </div>
+            <input type="hidden" id="scheduleDeviceId">
+            <button class="btn-connect" onclick="saveScheduleSettings()" style="margin-top:16px;">Save Schedule</button>
         </div>
     </div>
 
@@ -1321,6 +1357,7 @@
             loadTelegramConfig();
             loadOutputSetupSettings();
             loadRelay4CHConfig();
+            loadSchedulesLocal();
             renderSensorCards();
             renderOutputConfigList();
             renderControlCards();
@@ -1714,6 +1751,7 @@
         // ===== RELAY 4CH MODBUS CONFIG =====
         let relay4chConfig = {
             node: 2,
+            baud: 9600,
             coils: [0, 1, 2, 3],
             states: [false, false, false, false]
         };
@@ -1723,9 +1761,11 @@
             if (saved) {
                 const c = JSON.parse(saved);
                 if (c.node !== undefined) relay4chConfig.node = c.node;
+                if (c.baud !== undefined) relay4chConfig.baud = c.baud;
                 if (c.coils && Array.isArray(c.coils)) relay4chConfig.coils = c.coils;
                 
                 document.getElementById('relay4chNode').value = relay4chConfig.node;
+                document.getElementById('relay4chBaud').value = relay4chConfig.baud;
                 for(let i=0; i<4; i++) {
                     document.getElementById('relay_coil_' + i).value = relay4chConfig.coils[i];
                 }
@@ -1738,11 +1778,15 @@
             container.innerHTML = '';
             for(let i=0; i<4; i++) {
                 const isOn = relay4chConfig.states[i];
+                const dId = 'relay4ch_' + i;
                 container.innerHTML += `
                     <div class="control-card ${isOn ? 'on' : ''}">
                         <div class="card-top">
                             <span class="card-icon" style="font-size:24px;">${isOn ? '🟢' : '⚫'}</span>
-                            <span class="card-label" style="font-size:14px; font-weight:600;">Relay CH${i+1}</span>
+                            <div style="display:flex; justify-content:space-between; width:100%; align-items:center;">
+                                <span class="card-label" style="font-size:14px; font-weight:600; margin-left:8px;">Relay CH${i+1}</span>
+                                <span style="font-size:14px; cursor:pointer;" onclick="openScheduleModal('${dId}', 'Relay CH${i+1}')" title="Schedule">⏰</span>
+                            </div>
                         </div>
                         <label class="switch" style="margin-top:10px;">
                             <input type="checkbox" onchange="toggleRelay4CH(${i})" ${isOn ? 'checked' : ''}>
@@ -1782,10 +1826,12 @@
         
         function saveRelay4CHSettings() {
             const node = parseInt(document.getElementById('relay4chNode').value);
-            if (isNaN(node) || node < 1) {
-                alert("Invalid Target Slave Node ID!"); return;
+            const baud = parseInt(document.getElementById('relay4chBaud').value);
+            if (isNaN(node) || node < 1 || isNaN(baud)) {
+                alert("Invalid Modbus parameters!"); return;
             }
             relay4chConfig.node = node;
+            relay4chConfig.baud = baud;
             
             for(let i=0; i<4; i++) {
                 relay4chConfig.coils[i] = parseInt(document.getElementById('relay_coil_' + i).value) || 0;
@@ -1793,17 +1839,67 @@
             
             localStorage.setItem('esp32_relay4ch_config', JSON.stringify({
                 node: relay4chConfig.node,
+                baud: relay4chConfig.baud,
                 coils: relay4chConfig.coils
             }));
             
             closeRelay4CHModal();
-            log(`Relay 4CH Config saved: Node ${node}`);
+            log(`Relay 4CH Config saved: Node ${node}, ${baud}bps`);
             
             if (isConnected && client && !demoInterval) {
                 client.publish(TOPICS.control, JSON.stringify({ 
                     device: 'relay4ch_setup', 
                     action: 'configure', 
-                    params: { node: relay4chConfig.node, coils: relay4chConfig.coils }
+                    params: { node: relay4chConfig.node, baud: relay4chConfig.baud, coils: relay4chConfig.coils }
+                }));
+            }
+        }
+
+        // ===== SCHEDULE LOGIC =====
+        let schedulesConfig = {};
+
+        function loadSchedulesLocal() {
+            const saved = localStorage.getItem('esp32_schedules_config');
+            if (saved) schedulesConfig = JSON.parse(saved);
+        }
+
+        function saveSchedulesLocal() {
+            localStorage.setItem('esp32_schedules_config', JSON.stringify(schedulesConfig));
+        }
+
+        function openScheduleModal(deviceId, deviceName) {
+            document.getElementById('scheduleDeviceId').value = deviceId;
+            document.getElementById('scheduleModalTitle').textContent = `Timer: ${deviceName}`;
+            const conf = schedulesConfig[deviceId] || {enabled: false, on: '', off: ''};
+            
+            document.getElementById('scheduleEnableCheck').checked = conf.enabled;
+            document.getElementById('scheduleOnTime').value = conf.on;
+            document.getElementById('scheduleOffTime').value = conf.off;
+            
+            document.getElementById('scheduleModal').classList.add('open');
+        }
+
+        function closeScheduleModal() {
+            document.getElementById('scheduleModal').classList.remove('open');
+        }
+
+        function saveScheduleSettings() {
+            const dId = document.getElementById('scheduleDeviceId').value;
+            const enabled = document.getElementById('scheduleEnableCheck').checked;
+            const onTime = document.getElementById('scheduleOnTime').value;
+            const offTime = document.getElementById('scheduleOffTime').value;
+
+            const conf = { enabled, on: onTime, off: offTime };
+            schedulesConfig[dId] = conf;
+            saveSchedulesLocal();
+            closeScheduleModal();
+            log(`Schedule for ${dId} saved.`);
+
+            if (isConnected && client && !demoInterval) {
+                client.publish(TOPICS.control, JSON.stringify({ 
+                    device: 'schedule', 
+                    action: 'configure', 
+                    params: { id: dId, enabled: enabled, on: onTime, off: offTime }
                 }));
             }
         }
@@ -2162,11 +2258,16 @@
             container.innerHTML = '';
             ALL_OUTPUTS.filter(o => o.enabled).forEach(out => {
                 container.innerHTML += `
-                    <button class="ctrl-btn ${out.state ? 'on' : 'off'}" id="btn_${out.id}" onclick="toggleDevice('${out.id}')">
-                        <span class="btn-icon">${out.icon}</span>
-                        <span class="btn-label">${out.name}</span>
-                        <span class="btn-status" id="status_${out.id}">${out.state ? 'ON' : 'OFF'}</span>
-                    </button>
+                    <div class="ctrl-btn ${out.state ? 'on' : 'off'}" id="btn_${out.id}">
+                        <div style="display:flex; justify-content:space-between; width:100%; margin-bottom:6px;">
+                            <span class="btn-icon">${out.icon}</span>
+                            <span style="font-size:14px; cursor:pointer;" onclick="openScheduleModal('${out.id}', '${out.name}')" title="Schedule">⏰</span>
+                        </div>
+                        <div style="flex-grow:1; display:flex; flex-direction:column; justify-content:center;" onclick="toggleDevice('${out.id}')">
+                            <span class="btn-label">${out.name}</span>
+                            <span class="btn-status" id="status_${out.id}">${out.state ? 'ON' : 'OFF'}</span>
+                        </div>
+                    </div>
                 `;
             });
         }

@@ -14,7 +14,13 @@
 #include <ArduinoJson.h>
 #include <ModbusMaster.h>
 #include <HTTPClient.h>
+#include <time.h>
 #include "config.h"
+
+// ===== NTP TIME CONSTANTS =====
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC (7 * 3600)
+#define DAYLIGHT_OFFSET_SEC 0
 
 // ===== OBJECTS =====
 WiFiClientSecure espClient;
@@ -43,6 +49,8 @@ OutputPin outputs[NUM_OUTPUTS] = {
 // Function declarations
 void updateOutputPins();
 void sendTelegram(String message);
+void triggerDevice(String deviceId, bool state);
+void toggleDevice(String deviceId);
 
 // ===== TELEGRAM CONFIG & FAULT FLAGS =====
 bool teleEnabled = false;
@@ -92,15 +100,26 @@ unsigned long lastReconnect = 0;
 // ===== MODBUS RELAY 4CH CONFIG =====
 struct Relay4CHConfig {
   int node;
+  int baud;
   uint16_t coils[4];
   bool states[4];
 };
 Relay4CHConfig relay4ch = {
-  2,                     // Default Node ID
+  2, 9600,               // Default Node ID & Baud
   {0, 1, 2, 3},          // Default Coil Addresses
   {false, false, false, false} // Default States
 };
 int meterNode = 1; // Default Power Meter Modbus ID
+
+// ===== SCHEDULE CONFIG =====
+struct ScheduleConfig {
+  String id;
+  bool enabled;
+  int onH, onM;
+  int offH, offM;
+};
+ScheduleConfig schedules[10]; // Allow up to 10 active schedules
+int lastScheduleMin = -1;
 
 // ===== RS485 DIRECTION CONTROL =====
 void preTransmission() {
@@ -242,7 +261,13 @@ void setupWiFi() {
 
   // 4. Luu profile nay vao bo nho Multi-WiFi
   saveWiFiProfile(WiFi.SSID(), WiFi.psk());
-}// ===== NATIVE TELEGRAM BOT ALERTS =====
+
+  // Init NTP Time
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+  Serial.println("NTP Time Sync Initialized (GMT+7)");
+}
+
+// ===== NATIVE TELEGRAM BOT ALERTS =====
 void sendTelegram(String message) {
   if (!teleEnabled || teleToken == "" || teleChatId == "") return;
 
@@ -359,6 +384,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       // 4. Modbus Relay 4CH Setup
       if (strcmp(device, "relay4ch_setup") == 0 && strcmp(action, "configure") == 0) {
         relay4ch.node = doc["params"]["node"] | 2;
+        relay4ch.baud = doc["params"]["baud"] | 9600;
         if (doc["params"]["coils"].is<JsonArray>()) {
           JsonArray cArray = doc["params"]["coils"].as<JsonArray>();
           for(int i=0; i<4 && i<cArray.size(); i++) {
@@ -368,6 +394,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         
         preferences.begin("relay4ch", false);
         preferences.putInt("node", relay4ch.node);
+        preferences.putInt("baud", relay4ch.baud);
         for(int i=0; i<4; i++) {
            preferences.putInt(("c_" + String(i)).c_str(), relay4ch.coils[i]);
         }
@@ -382,41 +409,126 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         int ch = doc["channel"] | 0;
         bool state = doc["state"] | false;
         if (ch >= 0 && ch < 4) {
-          // Switch to Relay Node
-          modbus.begin(relay4ch.node, Serial2);
-          // Modbus RTU write single coil: 0xFF00 for ON, 0x0000 for OFF
-          uint8_t result = modbus.writeSingleCoil(relay4ch.coils[ch], state ? 0xFF00 : 0x0000); 
-          if (result == modbus.ku8MBSuccess) {
-             relay4ch.states[ch] = state;
-             Serial.printf("Relay 4CH - Ch %d set to %s\n", ch, state ? "ON" : "OFF");
-          } else {
-             Serial.printf("Relay 4CH - Ch %d set FAILED. Modbus Error: %02X\n", ch, result);
-          }
-          // Restore meter node
-          modbus.begin(meterNode, Serial2);
-          publishStatus();
+          triggerDevice("relay4ch_" + String(ch), state);
         }
         return;
       }
 
       // 6. Command to trigger toggles (relay, led, out3, out4, etc)
-      bool found = false;
       for (int i = 0; i < NUM_OUTPUTS; i++) {
         if (outputs[i].enabled && outputs[i].id == String(device)) {
-          if (strcmp(action, "toggle") == 0) {
-            outputs[i].state = !outputs[i].state;
-          } else if (strcmp(action, "on") == 0) {
-            outputs[i].state = true;
-          } else if (strcmp(action, "off") == 0) {
-            outputs[i].state = false;
-          }
-          digitalWrite(outputs[i].pin, outputs[i].state ? HIGH : LOW);
-          Serial.printf("Output %s (Pin %d) is now: %s\n", outputs[i].id.c_str(), outputs[i].pin, outputs[i].state ? "ON" : "OFF");
-          found = true;
+          bool st = outputs[i].state;
+          if (strcmp(action, "toggle") == 0) st = !st;
+          else if (strcmp(action, "on") == 0) st = true;
+          else if (strcmp(action, "off") == 0) st = false;
+          
+          triggerDevice(String(device), st);
           break;
         }
       }
-      if (found) publishStatus();
+      
+      // 7. Schedule Setup
+      if (strcmp(device, "schedule") == 0 && strcmp(action, "configure") == 0) {
+        String idStr = doc["params"]["id"].as<String>();
+        bool enabled = doc["params"]["enabled"] | false;
+        String onTime = doc["params"]["on"].as<String>();
+        String offTime = doc["params"]["off"].as<String>();
+        
+        int onH = onTime.substring(0, 2).toInt();
+        int onM = onTime.substring(3, 5).toInt();
+        int offH = offTime.substring(0, 2).toInt();
+        int offM = offTime.substring(3, 5).toInt();
+        
+        int schIdx = -1;
+        for(int i=0; i<10; i++) {
+           if (schedules[i].id == idStr || schedules[i].id == "") {
+              schIdx = i; break;
+           }
+        }
+        if (schIdx != -1) {
+           schedules[schIdx].id = idStr;
+           schedules[schIdx].enabled = enabled;
+           schedules[schIdx].onH = onH; schedules[schIdx].onM = onM;
+           schedules[schIdx].offH = offH; schedules[schIdx].offM = offM;
+           
+           preferences.begin("schedules", false);
+           String base = "sch_" + String(schIdx);
+           preferences.putString((base + "_id").c_str(), idStr);
+           preferences.putBool((base + "_en").c_str(), enabled);
+           preferences.putInt((base + "_onH").c_str(), onH);
+           preferences.putInt((base + "_onM").c_str(), onM);
+           preferences.putInt((base + "_ofH").c_str(), offH);
+           preferences.putInt((base + "_ofM").c_str(), offM);
+           preferences.end();
+           Serial.println("Schedule saved for: " + idStr);
+        }
+        return;
+      }
+    }
+  }
+}
+
+// ===== TRIGGER DEVICE (Used by MQTT and NTP Timer) =====
+void triggerDevice(String deviceId, bool state) {
+  // Check common outputs
+  for (int i = 0; i < NUM_OUTPUTS; i++) {
+    if (outputs[i].enabled && outputs[i].id == deviceId) {
+      outputs[i].state = state;
+      digitalWrite(outputs[i].pin, outputs[i].state ? HIGH : LOW);
+      publishStatus();
+      Serial.printf("Output %s (Pin %d) is now: %s\n", outputs[i].id.c_str(), outputs[i].pin, outputs[i].state ? "ON" : "OFF");
+      return;
+    }
+  }
+  
+  // Check Relay4CH
+  for(int ch=0; ch<4; ch++) {
+    if(deviceId == "relay4ch_" + String(ch)) {
+      Serial2.flush();
+      Serial2.updateBaudRate(relay4ch.baud); // Change to relay baud rate
+      modbus.begin(relay4ch.node, Serial2);
+      
+      uint8_t result = modbus.writeSingleCoil(relay4ch.coils[ch], state ? 0xFF00 : 0x0000); 
+      if (result == modbus.ku8MBSuccess) {
+         relay4ch.states[ch] = state;
+         Serial.printf("Relay 4CH - Ch %d set to %s\n", ch, state ? "ON" : "OFF");
+      } else {
+         Serial.printf("Relay 4CH - Ch %d set FAILED. Modbus Error: %02X\n", ch, result);
+      }
+      
+      Serial2.flush();
+      delay(10);
+      Serial2.updateBaudRate(MODBUS_BAUD); // Revert to meter baud rate
+      modbus.begin(meterNode, Serial2);
+      publishStatus();
+      return;
+    }
+  }
+}
+
+// ===== HANDLE SCHEDULES =====
+void handleSchedules() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return; // NTP not synced yet
+  
+  int h = timeinfo.tm_hour;
+  int m = timeinfo.tm_min;
+  
+  if (m == lastScheduleMin) return; // Process only once per minute
+  lastScheduleMin = m;
+  
+  for(int i=0; i<10; i++) {
+    if(!schedules[i].enabled || schedules[i].id == "") continue;
+    
+    // Check ON time
+    if(schedules[i].onH == h && schedules[i].onM == m) {
+      Serial.printf("Schedule Trigger: %s -> ON\n", schedules[i].id.c_str());
+      triggerDevice(schedules[i].id, true);
+    }
+    // Check OFF time
+    else if(schedules[i].offH == h && schedules[i].offM == m) {
+      Serial.printf("Schedule Trigger: %s -> OFF\n", schedules[i].id.c_str());
+      triggerDevice(schedules[i].id, false);
     }
   }
 }
@@ -684,6 +796,8 @@ void loop() {
     connectMQTT();
   }
   mqtt.loop();
+  
+  handleSchedules();
 
   unsigned long now = millis();
 
