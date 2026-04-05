@@ -89,6 +89,19 @@ unsigned long lastMeterRead = 0;
 unsigned long lastMqttPub = 0;
 unsigned long lastReconnect = 0;
 
+// ===== MODBUS RELAY 4CH CONFIG =====
+struct Relay4CHConfig {
+  int node;
+  uint16_t coils[4];
+  bool states[4];
+};
+Relay4CHConfig relay4ch = {
+  2,                     // Default Node ID
+  {0, 1, 2, 3},          // Default Coil Addresses
+  {false, false, false, false} // Default States
+};
+int meterNode = 1; // Default Power Meter Modbus ID
+
 // ===== RS485 DIRECTION CONTROL =====
 void preTransmission() {
   digitalWrite(RS485_DE_RE_PIN, HIGH);  // Enable transmit
@@ -317,14 +330,15 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 
       // 3. Modbus Config
       if (strcmp(device, "modbus") == 0 && strcmp(action, "configure") == 0) {
-        // Doc cac thong so co ban nhu port, baudrate (da support tu truoc) thi nam trong doc["params"]["node"]
-        int node = doc["params"]["node"] | 1;
-        // Luu vao Preferences (Co the phai khoi dong lai de nhan baudrate/serial, o day tam bo qua baud rate)
+        int nKey = doc["params"]["node"] | 1;
         
         // Map configs
         if (doc["params"]["map"].is<JsonArray>()) {
           JsonArray mapArray = doc["params"]["map"].as<JsonArray>();
           preferences.begin("modbus", false);
+          preferences.putInt("node", nKey);
+          meterNode = nKey;
+
           for (int i=0; i < mapArray.size() && i < NUM_MODBUS_PARAMS; i++) {
              modbusMap[i].id = mapArray[i]["id"].as<String>();
              modbusMap[i].reg = mapArray[i]["reg"].as<int>();
@@ -342,7 +356,50 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         return;
       }
 
-      // 4. Command to trigger toggles (relay, led, out3, out4, etc)
+      // 4. Modbus Relay 4CH Setup
+      if (strcmp(device, "relay4ch_setup") == 0 && strcmp(action, "configure") == 0) {
+        relay4ch.node = doc["params"]["node"] | 2;
+        if (doc["params"]["coils"].is<JsonArray>()) {
+          JsonArray cArray = doc["params"]["coils"].as<JsonArray>();
+          for(int i=0; i<4 && i<cArray.size(); i++) {
+            relay4ch.coils[i] = cArray[i].as<int>();
+          }
+        }
+        
+        preferences.begin("relay4ch", false);
+        preferences.putInt("node", relay4ch.node);
+        for(int i=0; i<4; i++) {
+           preferences.putInt(("c_" + String(i)).c_str(), relay4ch.coils[i]);
+        }
+        preferences.end();
+        Serial.println("Relay 4CH Config saved.");
+        sendTelegram("✅ Cấu hình trạm Relay 4CH Modbus đã lưu thành công!");
+        return;
+      }
+
+      // 5. Modbus Relay 4CH Toggle Command
+      if (strcmp(device, "relay4ch") == 0 && strcmp(action, "toggle") == 0) {
+        int ch = doc["channel"] | 0;
+        bool state = doc["state"] | false;
+        if (ch >= 0 && ch < 4) {
+          // Switch to Relay Node
+          modbus.begin(relay4ch.node, Serial2);
+          // Modbus RTU write single coil: 0xFF00 for ON, 0x0000 for OFF
+          uint8_t result = modbus.writeSingleCoil(relay4ch.coils[ch], state ? 0xFF00 : 0x0000); 
+          if (result == modbus.ku8MBSuccess) {
+             relay4ch.states[ch] = state;
+             Serial.printf("Relay 4CH - Ch %d set to %s\n", ch, state ? "ON" : "OFF");
+          } else {
+             Serial.printf("Relay 4CH - Ch %d set FAILED. Modbus Error: %02X\n", ch, result);
+          }
+          // Restore meter node
+          modbus.begin(meterNode, Serial2);
+          publishStatus();
+        }
+        return;
+      }
+
+      // 6. Command to trigger toggles (relay, led, out3, out4, etc)
       bool found = false;
       for (int i = 0; i < NUM_OUTPUTS; i++) {
         if (outputs[i].enabled && outputs[i].id == String(device)) {
@@ -424,6 +481,11 @@ void publishStatus() {
     if(outputs[i].enabled) {
       doc[outputs[i].id] = outputs[i].state;
     }
+  }
+  
+  // Relay 4CH statuses
+  for(int i=0; i<4; i++) {
+    doc["relay4ch_" + String(i)] = relay4ch.states[i];
   }
 
   char buffer[256];
@@ -563,6 +625,7 @@ void setup() {
   
   // Load Modbus configs from NVS
   preferences.begin("modbus", true);
+  meterNode = preferences.getInt("node", 1);
   for (int i=0; i < NUM_MODBUS_PARAMS; i++) {
     String base = "mb_" + String(i);
     modbusMap[i].id = preferences.getString((base + "_id").c_str(), modbusMap[i].id);
@@ -571,6 +634,14 @@ void setup() {
       modbusMap[i].reg = preferences.getInt((base + "_reg").c_str(), modbusMap[i].reg);
       modbusMap[i].type = preferences.getString((base + "_ty").c_str(), modbusMap[i].type);
     }
+  }
+  preferences.end();
+
+  // Load Relay4CH config from NVS
+  preferences.begin("relay4ch", true);
+  relay4ch.node = preferences.getInt("node", 2);
+  for(int i=0; i<4; i++) {
+    relay4ch.coils[i] = preferences.getInt(("c_" + String(i)).c_str(), relay4ch.coils[i]);
   }
   preferences.end();
 
@@ -585,7 +656,7 @@ void setup() {
 
   // Modbus RTU via RS485
   Serial2.begin(MODBUS_BAUD, SERIAL_8N1, RS485_RX_PIN, RS485_TX_PIN);
-  modbus.begin(MODBUS_SLAVE_ID, Serial2);
+  modbus.begin(meterNode, Serial2);
   modbus.preTransmission(preTransmission);
   modbus.postTransmission(postTransmission);
 

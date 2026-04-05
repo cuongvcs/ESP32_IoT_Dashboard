@@ -798,11 +798,12 @@
     <!-- Tabs Navigation -->
     <div class="tab-nav">
         <button class="tab-btn active" onclick="switchTab('main')">Main View</button>
-        <button class="tab-btn" onclick="switchTab('config')">Settings</button>
         <button class="tab-btn" onclick="switchTab('sensors')">Sensors</button>
         <button class="tab-btn" onclick="switchTab('controls')">Controls</button>
+        <button class="tab-btn" onclick="switchTab('relay4ch')">Relay Modbus</button>
         <button class="tab-btn" onclick="switchTab('meter')">Power Meter</button>
         <button class="tab-btn" onclick="switchTab('log')">System Log</button>
+        <button class="tab-btn" onclick="switchTab('config')">⚙️ Settings</button>
     </div>
 
     <div class="container">
@@ -1057,6 +1058,17 @@
             </div>
         </div>
 
+        <!-- Relay 4CH Station -->
+        <div class="section" id="relay4chSection">
+            <div class="section-header" style="justify-content: flex-start; gap: 8px;">
+                <span class="section-title">Relay 4CH Server</span>
+                <button class="sensor-settings-btn" style="margin-left:auto;" onclick="openRelay4CHModal()">⚙️ Config</button>
+            </div>
+            <div class="controls" id="relay4chCards">
+                <!-- Dynamically populated by JS -->
+            </div>
+        </div>
+
         <!-- Log -->
         <div class="section" id="logSection">
             <div class="log-panel">
@@ -1154,6 +1166,34 @@
         </div>
     </div>
 
+    <!-- Relay 4CH Modbus Config Modal -->
+    <div class="modal-overlay" id="relay4chModal">
+        <div class="modal">
+            <button class="modal-close" onclick="closeRelay4CHModal()">&times;</button>
+            <h3 style="margin-bottom: 2px;">Relay Station Modbus</h3>
+            <p style="font-size:11px; color:var(--text-secondary); text-align:left; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:8px;">
+                Configure the Modbus Slave ID and Coils Address for the external 4-Channel Relay.
+            </p>
+            
+            <div class="config-row">
+                <label>Target Slave Node ID</label>
+                <input type="number" id="relay4chNode" placeholder="2" value="2" min="1" max="247">
+            </div>
+
+            <div style="margin-top: 14px; padding-top:14px; border-top:1px solid var(--border);">
+                <label style="font-size:12px; font-weight:600; color:var(--accent-blue); display:block; margin-bottom:8px;">Coil Register Map</label>
+                <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px;">
+                    <div><label style="font-size:10px; color:var(--text-secondary);">CH1 Coil Address</label><input type="number" id="relay_coil_0" value="0" style="width:100%; padding:6px; font-size:11px;"></div>
+                    <div><label style="font-size:10px; color:var(--text-secondary);">CH2 Coil Address</label><input type="number" id="relay_coil_1" value="1" style="width:100%; padding:6px; font-size:11px;"></div>
+                    <div><label style="font-size:10px; color:var(--text-secondary);">CH3 Coil Address</label><input type="number" id="relay_coil_2" value="2" style="width:100%; padding:6px; font-size:11px;"></div>
+                    <div><label style="font-size:10px; color:var(--text-secondary);">CH4 Coil Address</label><input type="number" id="relay_coil_3" value="3" style="width:100%; padding:6px; font-size:11px;"></div>
+                </div>
+            </div>
+
+            <button class="btn-connect" onclick="saveRelay4CHSettings()" style="margin-top:16px;">Save Settings</button>
+        </div>
+    </div>
+
     <!-- WiFi Config Modal -->
     <div class="modal-overlay" id="wifiModal">
         <div class="modal">
@@ -1237,17 +1277,12 @@
 
         const TOPICS = { sensors: 'esp32/sensors', meter: 'esp32/meter', status: 'esp32/status', control: 'esp32/control', wifi: 'esp32/wifi_status' };
 
-        // ===== TAB NAVIGATION =====
+        // ===== TAB SWITCHING =====
         function switchTab(tabId) {
-            // Update buttons
-            document.querySelectorAll('.tab-btn').forEach(btn => {
-                btn.classList.remove('active');
-            });
-            const activeBtn = document.querySelector(`.tab-btn[onclick*="${tabId}"]`);
-            if (activeBtn) activeBtn.classList.add('active');
+            document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
+            event.currentTarget.classList.add('active');
 
-            // Hide all sections
-            const sections = ['configSection', 'sensorSection', 'meterSection', 'controlSection', 'logSection'];
+            const sections = ['configSection', 'sensorSection', 'meterSection', 'controlSection', 'relay4chSection', 'logSection'];
             sections.forEach(id => {
                 const el = document.getElementById(id);
                 if (el) el.style.display = 'none';
@@ -1255,7 +1290,7 @@
 
             // Show selected view
             if (tabId === 'main') {
-                ['sensorSection', 'meterSection', 'controlSection'].forEach(id => {
+                ['sensorSection', 'meterSection', 'controlSection', 'relay4chSection'].forEach(id => {
                     const el = document.getElementById(id);
                     if (el) el.style.display = 'block';
                 });
@@ -1265,6 +1300,7 @@
                 if (tabId === 'config') targetId = 'configSection';
                 else if (tabId === 'sensors') targetId = 'sensorSection';
                 else if (tabId === 'controls') targetId = 'controlSection';
+                else if (tabId === 'relay4ch') targetId = 'relay4chSection';
                 else if (tabId === 'meter') targetId = 'meterSection';
                 else if (tabId === 'log') targetId = 'logSection';
 
@@ -1284,9 +1320,11 @@
             loadStorageConfig();
             loadTelegramConfig();
             loadOutputSetupSettings();
+            loadRelay4CHConfig();
             renderSensorCards();
             renderOutputConfigList();
             renderControlCards();
+            renderRelay4CHUI();
             switchTab('main'); // Initialize tab
             log('Dashboard ready. Configure MQTT or launch Demo Mode.');
         };
@@ -1673,6 +1711,103 @@
             }
         }
 
+        // ===== RELAY 4CH MODBUS CONFIG =====
+        let relay4chConfig = {
+            node: 2,
+            coils: [0, 1, 2, 3],
+            states: [false, false, false, false]
+        };
+
+        function loadRelay4CHConfig() {
+            const saved = localStorage.getItem('esp32_relay4ch_config');
+            if (saved) {
+                const c = JSON.parse(saved);
+                if (c.node !== undefined) relay4chConfig.node = c.node;
+                if (c.coils && Array.isArray(c.coils)) relay4chConfig.coils = c.coils;
+                
+                document.getElementById('relay4chNode').value = relay4chConfig.node;
+                for(let i=0; i<4; i++) {
+                    document.getElementById('relay_coil_' + i).value = relay4chConfig.coils[i];
+                }
+            }
+        }
+
+        function renderRelay4CHUI() {
+            const container = document.getElementById('relay4chCards');
+            if (!container) return;
+            container.innerHTML = '';
+            for(let i=0; i<4; i++) {
+                const isOn = relay4chConfig.states[i];
+                container.innerHTML += `
+                    <div class="control-card ${isOn ? 'on' : ''}">
+                        <div class="card-top">
+                            <span class="card-icon" style="font-size:24px;">${isOn ? '🟢' : '⚫'}</span>
+                            <span class="card-label" style="font-size:14px; font-weight:600;">Relay CH${i+1}</span>
+                        </div>
+                        <label class="switch" style="margin-top:10px;">
+                            <input type="checkbox" onchange="toggleRelay4CH(${i})" ${isOn ? 'checked' : ''}>
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                `;
+            }
+        }
+
+        function toggleRelay4CH(channelIndex) {
+            const newState = !relay4chConfig.states[channelIndex];
+            relay4chConfig.states[channelIndex] = newState; // Optimistic update
+            renderRelay4CHUI();
+            
+            if (isConnected && client && !demoInterval) {
+                client.publish(TOPICS.control, JSON.stringify({ 
+                    device: 'relay4ch', 
+                    action: 'toggle', 
+                    channel: channelIndex, 
+                    state: newState 
+                }));
+                log(`Sent command: Relay CH${channelIndex+1} -> ${newState ? 'ON' : 'OFF'}`);
+            } else if (demoInterval) {
+                log(`[Demo] Modbus Relay CH${channelIndex+1} -> ${newState ? 'ON' : 'OFF'} applied`);
+            }
+        }
+
+        function openRelay4CHModal() {
+            loadRelay4CHConfig();
+            document.getElementById('relay4chModal').classList.add('open');
+        }
+        
+        function closeRelay4CHModal() {
+            document.getElementById('relay4chModal').classList.remove('open');
+        }
+        
+        function saveRelay4CHSettings() {
+            const node = parseInt(document.getElementById('relay4chNode').value);
+            if (isNaN(node) || node < 1) {
+                alert("Invalid Target Slave Node ID!"); return;
+            }
+            relay4chConfig.node = node;
+            
+            for(let i=0; i<4; i++) {
+                relay4chConfig.coils[i] = parseInt(document.getElementById('relay_coil_' + i).value) || 0;
+            }
+            
+            localStorage.setItem('esp32_relay4ch_config', JSON.stringify({
+                node: relay4chConfig.node,
+                coils: relay4chConfig.coils
+            }));
+            
+            closeRelay4CHModal();
+            log(`Relay 4CH Config saved: Node ${node}`);
+            
+            if (isConnected && client && !demoInterval) {
+                client.publish(TOPICS.control, JSON.stringify({ 
+                    device: 'relay4ch_setup', 
+                    action: 'configure', 
+                    params: { node: relay4chConfig.node, coils: relay4chConfig.coils }
+                }));
+            }
+        }
+
         // ===== WIFI CONFIG =====
         function loadWifiConfig() {
             const saved = localStorage.getItem('esp32_wifi_config');
@@ -1877,6 +2012,18 @@
                 ALL_OUTPUTS.forEach(out => {
                     if (data[out.id] !== undefined) updateDevice(out.id, data[out.id]);
                 });
+                
+                // Parse modbus 4CH Relay states from status payload
+                let relayUpdate = false;
+                for(let i=0; i<4; i++) {
+                    const ch_key = 'relay4ch_' + i;
+                    if (data[ch_key] !== undefined) {
+                        relay4chConfig.states[i] = !!data[ch_key];
+                        relayUpdate = true;
+                    }
+                }
+                if (relayUpdate) renderRelay4CHUI();
+                
             } else if (topic === TOPICS.wifi) {
                 espWifiConnected = data.connected;
                 updateWifiUI(data.ssid, data.rssi);
