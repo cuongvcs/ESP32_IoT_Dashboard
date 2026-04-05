@@ -7,9 +7,9 @@
 #define CONFIG_H
 
 // ===== WIFI CONFIGURATION =====
-// Dien ten WiFi va mat khau nha ban vao day
-#define WIFI_SSID       "Cuong VCS"
-#define WIFI_PASSWORD   "minhtri2016"
+// KHÔNG CẦN ĐIỀN PASS Ở ĐÂY NỮA. (Sử dụng WiFiManager qua giao diện Web Captive Portal)
+// #define WIFI_SSID       "Cuong VCS"
+// #define WIFI_PASSWORD   "minhtri2016"
 
 // ===== MQTT CONFIGURATION =====
 // Dien thong tin MQTT broker (HiveMQ Cloud hoac broker khac)

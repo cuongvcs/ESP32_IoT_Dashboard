@@ -7,10 +7,13 @@
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
 #include <PubSubClient.h>
 #include <DHT.h>
 #include <ArduinoJson.h>
 #include <ModbusMaster.h>
+#include <HTTPClient.h>
 #include "config.h"
 
 // ===== OBJECTS =====
@@ -19,9 +22,35 @@ PubSubClient mqtt(espClient);
 DHT dht(DHT_PIN, DHT_TYPE);
 ModbusMaster modbus;
 
-// ===== STATE VARIABLES =====
-bool relayState = false;
-bool ledState = false;
+// ===== DYNAMIC OUTPUT MANAGER =====
+#define NUM_OUTPUTS 6
+struct OutputPin {
+  String id;
+  int pin;
+  bool state;
+  bool enabled;
+};
+// Default mapping based on Web Dashboard defaults
+OutputPin outputs[NUM_OUTPUTS] = {
+  {"relay", RELAY_PIN, false, true},
+  {"led", LED_PIN, false, true},
+  {"out3", 14, false, false},
+  {"out4", 12, false, false},
+  {"out5", 13, false, false},
+  {"out6", 27, false, false}
+};
+
+// Function declarations
+void updateOutputPins();
+void sendTelegram(String message);
+
+// ===== TELEGRAM CONFIG & FAULT FLAGS =====
+bool teleEnabled = false;
+String teleToken = "";
+String teleChatId = "";
+bool sensorFault = false;
+bool meterFault = false;
+unsigned long lastTeleAlert = 0;
 
 // Sensor data
 float temperature = 0;
@@ -47,6 +76,56 @@ void preTransmission() {
   digitalWrite(RS485_DE_RE_PIN, HIGH);  // Enable transmit
 }
 
+// ===== MULTI-WIFI PROFILER (PREFERENCES) =====
+Preferences preferences;
+#define MAX_WIFI_PROFILES 5
+
+struct WiFiProfile {
+  String ssid;
+  String pass;
+};
+WiFiProfile wifiProfiles[MAX_WIFI_PROFILES];
+
+void loadWiFiProfiles() {
+  preferences.begin("wifi_config", false);
+  for (int i = 0; i < MAX_WIFI_PROFILES; i++) {
+    wifiProfiles[i].ssid = preferences.getString(("ssid_" + String(i)).c_str(), "");
+    wifiProfiles[i].pass = preferences.getString(("pass_" + String(i)).c_str(), "");
+  }
+  preferences.end();
+}
+
+void saveWiFiProfile(String new_ssid, String new_pass) {
+  if (new_ssid == "") return;
+  loadWiFiProfiles();
+  
+  // Kiem tra xem da co chua
+  for (int i = 0; i < MAX_WIFI_PROFILES; i++) {
+    if (wifiProfiles[i].ssid == new_ssid) {
+      if (wifiProfiles[i].pass != new_pass) {
+        preferences.begin("wifi_config", false);
+        preferences.putString(("pass_" + String(i)).c_str(), new_pass);
+        preferences.end();
+      }
+      return; // Đã lưu
+    }
+  }
+  
+  // Chua co -> Dich array va the vao vi tri [0]
+  preferences.begin("wifi_config", false);
+  for (int i = MAX_WIFI_PROFILES - 1; i > 0; i--) {
+    wifiProfiles[i] = wifiProfiles[i-1];
+    preferences.putString(("ssid_" + String(i)).c_str(), wifiProfiles[i].ssid);
+    preferences.putString(("pass_" + String(i)).c_str(), wifiProfiles[i].pass);
+  }
+  wifiProfiles[0].ssid = new_ssid;
+  wifiProfiles[0].pass = new_pass;
+  preferences.putString("ssid_0", new_ssid);
+  preferences.putString("pass_0", new_pass);
+  preferences.end();
+  Serial.println("Saved new WiFi profile: " + new_ssid);
+}
+
 void postTransmission() {
   digitalWrite(RS485_DE_RE_PIN, LOW);   // Enable receive
 }
@@ -66,76 +145,153 @@ float readModbusFloat(uint16_t reg) {
 
 // ===== SETUP WIFI =====
 void setupWiFi() {
-  Serial.print("Connecting to WiFi: ");
-  Serial.println(WIFI_SSID);
+  Serial.println("\nConnecting to WiFi / Scanning known networks...");
 
+  // 1. Load danh sach WiFi da tung vao
+  loadWiFiProfiles();
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  bool connected = false;
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+  // 2. Scan xem xung quanh co mang nao quen khong
+  int n = WiFi.scanNetworks();
+  for (int i = 0; i < n; i++) {
+    String scanned_ssid = WiFi.SSID(i);
+    for (int j = 0; j < MAX_WIFI_PROFILES; j++) {
+      if (wifiProfiles[j].ssid != "" && wifiProfiles[j].ssid == scanned_ssid) {
+        Serial.println("Found known network: " + scanned_ssid + ". Connecting...");
+        WiFi.begin(wifiProfiles[j].ssid.c_str(), wifiProfiles[j].pass.c_str());
+        
+        int attempts = 0;
+        while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+          delay(500); Serial.print("."); attempts++;
+        }
+        if (WiFi.status() == WL_CONNECTED) {
+          connected = true;
+          break; // Thoat vong switch profiles
+        }
+      }
+    }
+    if (connected) break; // Thoat vong scan networks
   }
 
+  // 3. Neu khong co mang wifi nao quen, khoi dong Captive Portal
+  if (!connected) {
+    Serial.println("\nNo known networks nearby. Starting Captive Portal (ESP32_Setup)...");
+    WiFiManager wm;
+    wm.setClass("invert");
+
+    // CODE DE TEST: Bo comment dong duoi de xoá sách nhớ, BẮT BUỘC phát WiFi_Setup
+    wm.resetSettings(); 
+    
+    bool res = wm.autoConnect("ESP32_Setup", "12345678"); 
+
+    if (!res) {
+      Serial.println("Failed to connect. Restarting...");
+      delay(1000);
+      ESP.restart();
+    }
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  // 4. Luu profile nay vao bo nho Multi-WiFi
+  saveWiFiProfile(WiFi.SSID(), WiFi.psk());
+}// ===== NATIVE TELEGRAM BOT ALERTS =====
+void sendTelegram(String message) {
+  if (!teleEnabled || teleToken == "" || teleChatId == "") return;
+
+  // Prevent spamming (only 1 message every 3 minutes unless it's an OK message)
+  unsigned long now = millis();
+  if (message.indexOf("ALARM") != -1 && (now - lastTeleAlert < 180000)) {
+     if (lastTeleAlert != 0) return; // Spam prevention 
+  }
+  if (message.indexOf("ALARM") != -1) lastTeleAlert = now;
+
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-    Serial.print("IP Address: ");
-    Serial.println(WiFi.localIP());
-  } else {
-    Serial.println("\nWiFi Connection Failed! Restarting...");
-    ESP.restart();
+    HTTPClient http;
+    String url = "https://api.telegram.org/bot" + teleToken + "/sendMessage?chat_id=" + teleChatId + "&text=" + message;
+    http.begin(url);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      Serial.println("Telegram sent successfully: " + message);
+    } else {
+      Serial.println("Telegram send error: " + String(httpCode));
+    }
+    http.end();
   }
 }
 
 // ===== MQTT CALLBACK (nhan lenh tu dien thoai) =====
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  // Parse JSON command
-  StaticJsonDocument<256> doc;
-  DeserializationError error = deserializeJson(doc, payload, length);
+  String message = "";
+  for (int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
   
-  if (error) {
-    Serial.println("Failed to parse MQTT command");
-    return;
-  }
-
-  const char* device = doc["device"];
-  const char* action = doc["action"];
-
-  Serial.print("Command received - Device: ");
-  Serial.print(device);
-  Serial.print(", Action: ");
-  Serial.println(action);
-
-  // Xu ly lenh dieu khien
-  if (strcmp(device, "relay") == 0) {
-    if (strcmp(action, "toggle") == 0) {
-      relayState = !relayState;
-    } else if (strcmp(action, "on") == 0) {
-      relayState = true;
-    } else if (strcmp(action, "off") == 0) {
-      relayState = false;
+  if (strcmp(topic, TOPIC_CONTROL) == 0) {
+    StaticJsonDocument<2048> doc;
+    DeserializationError error = deserializeJson(doc, message);
+    if (error) {
+      Serial.println("Failed to parse JSON control");
+      return;
     }
-    digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
-    Serial.print("Relay is now: ");
-    Serial.println(relayState ? "ON" : "OFF");
-  }
-  else if (strcmp(device, "led") == 0) {
-    if (strcmp(action, "toggle") == 0) {
-      ledState = !ledState;
-    } else if (strcmp(action, "on") == 0) {
-      ledState = true;
-    } else if (strcmp(action, "off") == 0) {
-      ledState = false;
-    }
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    Serial.print("LED is now: ");
-    Serial.println(ledState ? "ON" : "OFF");
-  }
 
-  // Gui trang thai moi ngay lap tuc sau khi dieu khien
-  publishStatus();
+    const char* device = doc["device"];
+    const char* action = doc["action"];
+
+    if (device && action) {
+      // 1. Output setup array config (from dashboard output config modal)
+      if (strcmp(device, "outputs_setup") == 0 && strcmp(action, "configure") == 0) {
+        JsonArray params = doc["params"].as<JsonArray>();
+        for (int i=0; i < params.size() && i < NUM_OUTPUTS; i++) {
+          outputs[i].id = params[i]["id"].as<String>();
+          outputs[i].pin = params[i]["pin"].as<int>();
+          outputs[i].enabled = params[i]["enabled"].as<bool>();
+        }
+        updateOutputPins(); // run pinMode
+        publishStatus();
+        Serial.println("Outputs Setup configured dynamically.");
+        return;
+      }
+      
+      // 2. Telegram webhook config
+      if (strcmp(device, "telegram") == 0 && strcmp(action, "configure") == 0) {
+        teleEnabled = doc["params"]["enabled"] | false;
+        teleToken = doc["params"]["token"].as<String>();
+        teleChatId = doc["params"]["chatId"].as<String>();
+        
+        preferences.begin("telegram", false);
+        preferences.putBool("enabled", teleEnabled);
+        preferences.putString("token", teleToken);
+        preferences.putString("chatId", teleChatId);
+        preferences.end();
+        Serial.println("Telegram Config saved.");
+        if(teleEnabled) sendTelegram("Bíp bíp! ESP32 System Telegram Configured Successfully!");
+        return;
+      }
+
+      // 3. Command to trigger toggles (relay, led, out3, out4, etc)
+      bool found = false;
+      for (int i = 0; i < NUM_OUTPUTS; i++) {
+        if (outputs[i].enabled && outputs[i].id == String(device)) {
+          if (strcmp(action, "toggle") == 0) {
+            outputs[i].state = !outputs[i].state;
+          } else if (strcmp(action, "on") == 0) {
+            outputs[i].state = true;
+          } else if (strcmp(action, "off") == 0) {
+            outputs[i].state = false;
+          }
+          digitalWrite(outputs[i].pin, outputs[i].state ? HIGH : LOW);
+          Serial.printf("Output %s (Pin %d) is now: %s\n", outputs[i].id.c_str(), outputs[i].pin, outputs[i].state ? "ON" : "OFF");
+          found = true;
+          break;
+        }
+      }
+      if (found) publishStatus();
+    }
+  }
 }
 
 // ===== CONNECT / RECONNECT MQTT =====
@@ -192,11 +348,15 @@ void publishMeter() {
 
 // ===== PUBLISH DEVICE STATUS =====
 void publishStatus() {
-  StaticJsonDocument<128> doc;
-  doc["relay"] = relayState;
-  doc["led"] = ledState;
+  StaticJsonDocument<256> doc;
+  
+  for(int i=0; i<NUM_OUTPUTS; i++){
+    if(outputs[i].enabled) {
+      doc[outputs[i].id] = outputs[i].state;
+    }
+  }
 
-  char buffer[128];
+  char buffer[256];
   serializeJson(doc, buffer);
   mqtt.publish(TOPIC_STATUS, buffer, true); // retained message
 }
@@ -215,47 +375,85 @@ void publishWifiStatus() {
 
 // ===== READ SENSORS =====
 void readSensors() {
-  temperature = dht.readTemperature();
-  humidity = dht.readHumidity();
+  float currentTemp = dht.readTemperature();
+  float currentHum = dht.readHumidity();
   lightLevel = analogRead(LDR_PIN);
 
-  // Kiem tra nan
-  if (isnan(temperature)) temperature = 0;
-  if (isnan(humidity)) humidity = 0;
+  // Fault Detection
+  if (isnan(currentTemp) || isnan(currentHum)) {
+    if (!sensorFault) {
+      Serial.println("DHT Sensor failed!");
+      sendTelegram("⚠️ ALARM: Cảm biến DHT22 đã mất kết nối hoặc bị hỏng!");
+      sensorFault = true;
+    }
+    temperature = 0; humidity = 0; // fallback ui
+  } else {
+    temperature = currentTemp;
+    humidity = currentHum;
+    if (sensorFault) {
+      sendTelegram("✅ OK: Cảm biến DHT22 đã hoạt động trở lại bình thường.");
+      sensorFault = false;
+    }
+  }
 
   Serial.printf("Temp: %.1f°C | Hum: %.1f%% | Light: %d\n", temperature, humidity, lightLevel);
 }
 
 // ===== READ POWER METER VIA MODBUS RTU =====
 void readMeter() {
-  meterVoltage = readModbusFloat(REG_VOLTAGE);
-  delay(50);
-  meterCurrent = readModbusFloat(REG_CURRENT);
-  delay(50);
-  meterPower = readModbusFloat(REG_POWER);
-  delay(50);
-  meterEnergy = readModbusFloat(REG_ENERGY);
-  delay(50);
-  meterFrequency = readModbusFloat(REG_FREQUENCY);
-  delay(50);
-  meterPF = readModbusFloat(REG_PF);
+  float newV = readModbusFloat(REG_VOLTAGE);
+  
+  if (newV < 0) {
+    if (!meterFault) {
+      Serial.println("Modbus Meter reading timeout!");
+      sendTelegram("⚠️ ALARM: Mất kết nối Modbus RTU tới Đồng hồ điện!");
+      meterFault = true;
+    }
+    meterVoltage = 0; meterCurrent = 0; meterPower = 0;
+    meterEnergy = 0; meterFrequency = 0; meterPF = 0;
+  } else {
+    meterVoltage = newV;
+    delay(50); meterCurrent = readModbusFloat(REG_CURRENT);
+    delay(50); meterPower = readModbusFloat(REG_POWER);
+    delay(50); meterEnergy = readModbusFloat(REG_ENERGY);
+    delay(50); meterFrequency = readModbusFloat(REG_FREQUENCY);
+    delay(50); meterPF = readModbusFloat(REG_PF);
+    
+    if (meterFault) {
+      sendTelegram("✅ OK: Quá trình đọc dữ liệu Modbus Đồng hồ điện đã khôi phục.");
+      meterFault = false;
+    }
+  }
 
   Serial.printf("Meter: %.1fV | %.2fA | %.1fW | %.2fkWh | %.1fHz | PF:%.2f\n",
     meterVoltage, meterCurrent, meterPower, meterEnergy, meterFrequency, meterPF);
 }
 
 // ===== SETUP =====
+void updateOutputPins() {
+  for (int i = 0; i < NUM_OUTPUTS; i++) {
+    if (outputs[i].enabled) {
+      pinMode(outputs[i].pin, OUTPUT);
+      digitalWrite(outputs[i].pin, outputs[i].state ? HIGH : LOW);
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   Serial.println("\n=== ESP32 IoT Dashboard ===");
 
-  // GPIO Setup
-  pinMode(RELAY_PIN, OUTPUT);
-  pinMode(LED_PIN, OUTPUT);
-  pinMode(RS485_DE_RE_PIN, OUTPUT);
+  // Load Telegram preferences
+  preferences.begin("telegram", true);
+  teleEnabled = preferences.getBool("enabled", false);
+  teleToken = preferences.getString("token", "");
+  teleChatId = preferences.getString("chatId", "");
+  preferences.end();
   
-  digitalWrite(RELAY_PIN, LOW);
-  digitalWrite(LED_PIN, LOW);
+  // Output Pins init
+  updateOutputPins();
+
+  pinMode(RS485_DE_RE_PIN, OUTPUT);
   digitalWrite(RS485_DE_RE_PIN, LOW);
 
   // DHT Sensor
