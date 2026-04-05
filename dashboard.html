@@ -1111,40 +1111,46 @@
 
     <!-- Modbus Config Modal -->
     <div class="modal-overlay" id="modbusModal">
-        <div class="modal">
+        <div class="modal" style="max-height: 90vh; overflow-y: auto;">
             <button class="modal-close" onclick="closeModbusModal()">&times;</button>
-            <h3>Modbus RTU Settings</h3>
-            <p style="font-size:11px; color:var(--text-secondary); text-align:center; margin-bottom:14px;">
-                Configure serial parameters for power meter
+            <h3 style="margin-bottom: 2px;">Modbus RTU Map</h3>
+            <p style="font-size:11px; color:var(--text-secondary); text-align:left; margin-bottom:14px; border-bottom:1px solid var(--border); padding-bottom:8px;">
+                Configure serial parameters and dynamic Modbus register map
             </p>
-            <div class="config-row">
-                <label>COM Port (Serial)</label>
-                <select id="modbusPort"
-                    style="width:100%; padding:9px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; color:var(--text-primary); font-size:13px;">
-                    <option value="COM1">COM1</option>
-                    <option value="COM2">COM2</option>
-                    <option value="COM3" selected>COM3</option>
-                    <option value="COM4">COM4</option>
-                    <option value="/dev/ttyUSB0">/dev/ttyUSB0 (Linux)</option>
-                    <option value="/dev/ttyS0">/dev/ttyS0 (Linux)</option>
-                </select>
+            
+            <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap:8px;">
+                <div class="config-row">
+                    <label style="font-size:10px;">COM Port</label>
+                    <select id="modbusPort" style="width:100%; padding:6px; background:var(--bg-input); border:1px solid var(--border); border-radius:4px; color:var(--text-primary); font-size:12px;">
+                        <option value="COM1">COM1</option>
+                        <option value="COM2">COM2</option>
+                        <option value="COM3" selected>COM3</option>
+                    </select>
+                </div>
+                <div class="config-row">
+                    <label style="font-size:10px;">Baud</label>
+                    <select id="modbusBaud" style="width:100%; padding:6px; background:var(--bg-input); border:1px solid var(--border); border-radius:4px; color:var(--text-primary); font-size:12px;">
+                        <option value="4800">4800</option>
+                        <option value="9600" selected>9600</option>
+                        <option value="19200">19200</option>
+                        <option value="38400">38400</option>
+                    </select>
+                </div>
+                <div class="config-row">
+                    <label style="font-size:10px;">Slave ID</label>
+                    <input type="number" id="modbusNode" placeholder="1" value="1" min="1" max="247" style="width:100%; padding:6px; background:var(--bg-input); border:1px solid var(--border); border-radius:4px; color:var(--text-primary); font-size:12px; margin-top:0;">
+                </div>
             </div>
-            <div class="config-row">
-                <label>Baud Rate</label>
-                <select id="modbusBaud"
-                    style="width:100%; padding:9px 12px; background:var(--bg-input); border:1px solid var(--border); border-radius:8px; color:var(--text-primary); font-size:13px;">
-                    <option value="4800">4800</option>
-                    <option value="9600" selected>9600</option>
-                    <option value="19200">19200</option>
-                    <option value="38400">38400</option>
-                    <option value="115200">115200</option>
-                </select>
+
+            <div style="margin-top: 14px; padding-top:14px; border-top:1px solid var(--border);">
+                <label style="font-size:12px; font-weight:600; color:var(--accent-blue); display:block; margin-bottom:8px;">Register Memory Map</label>
+                
+                <div id="modbusMapContainer" style="display:flex; flex-direction:column; gap:8px;">
+                    <!-- Javascript will populate this map dynamically -->
+                </div>
             </div>
-            <div class="config-row">
-                <label>Slave Node ID</label>
-                <input type="number" id="modbusNode" placeholder="1" value="1" min="1" max="247">
-            </div>
-            <button class="btn-connect" onclick="saveModbusSettings()" style="margin-top:16px;">Apply & Save</button>
+
+            <button class="btn-connect" onclick="saveModbusSettings()" style="margin-top:16px;">Save & Synchronize</button>
         </div>
     </div>
 
@@ -1570,17 +1576,64 @@
         }
 
         // ===== MODBUS CONFIG =====
+        // Default register mapping (Eastron SDM style - 32 bit Float)
+        const DEFAULT_MODBUS_MAP = [
+            { id: 'voltage', name: 'Voltage (V)', reg: 0, type: 'float32' },
+            { id: 'current', name: 'Current (A)', reg: 6, type: 'float32' },
+            { id: 'power', name: 'Power (W)', reg: 12, type: 'float32' },
+            { id: 'energy', name: 'Energy (kWh)', reg: 342, type: 'float32' },
+            { id: 'freq', name: 'Frequency (Hz)', reg: 70, type: 'float32' },
+            { id: 'pf', name: 'Power Factor', reg: 30, type: 'float32' }
+        ];
+
+        let currentModbusMap = JSON.parse(JSON.stringify(DEFAULT_MODBUS_MAP));
+
+        function renderModbusMapUI() {
+            const container = document.getElementById('modbusMapContainer');
+            container.innerHTML = '';
+            
+            const TYPE_OPTIONS = [
+                {val: 'int16', label: '16-bit Int'},
+                {val: 'int32', label: '32-bit Int'},
+                {val: 'float32', label: '32-bit Float'}
+            ];
+
+            currentModbusMap.forEach(item => {
+                let opts = '';
+                TYPE_OPTIONS.forEach(opt => {
+                    opts += `<option value="${opt.val}" ${item.type === opt.val ? 'selected' : ''}>${opt.label}</option>`;
+                });
+
+                container.innerHTML += `
+                    <div style="display:grid; grid-template-columns: 2fr 1fr 1.5fr; gap:6px; align-items:center; background:rgba(255,255,255,0.03); padding:6px; border-radius:6px; border:1px solid rgba(255,255,255,0.05);">
+                        <label style="font-size:11px; color:var(--text-secondary); margin:0;">${item.name}</label>
+                        <input type="number" id="mb_reg_${item.id}" value="${item.reg}" title="Register Address" style="width:100%; font-size:11px; padding:4px; margin:0;" min="0">
+                        <select id="mb_type_${item.id}" style="width:100%; font-size:11px; padding:4px; appearance:auto; margin:0;">
+                            ${opts}
+                        </select>
+                    </div>
+                `;
+            });
+        }
+
         function loadModbusConfig() {
             const saved = localStorage.getItem('esp32_modbus_config');
             if (saved) {
                 const c = JSON.parse(saved);
+                
+                // serial
                 const pEl = document.getElementById('modbusPort');
                 const pOpt = Array.from(pEl.options).find(o => o.value === c.port);
                 if (pOpt) pOpt.selected = true; else { pEl.add(new Option(c.port, c.port, true, true)); }
-
                 document.getElementById('modbusBaud').value = c.baud || '9600';
                 document.getElementById('modbusNode').value = c.node || '1';
+                
+                // map
+                if (c.map && Array.isArray(c.map)) {
+                    currentModbusMap = c.map;
+                }
             }
+            renderModbusMapUI();
         }
         function openModbusModal() {
             loadModbusConfig(); // fetch latest before opening
@@ -1595,15 +1648,23 @@
             const node = parseInt(document.getElementById('modbusNode').value);
 
             if (!port || isNaN(baud) || isNaN(node)) {
-                alert("Invalid parameters!"); return;
+                alert("Invalid serial parameters!"); return;
             }
 
-            const configObj = { port, baud, node };
+            // Extract map inputs
+            currentModbusMap.forEach(item => {
+                const r = document.getElementById('mb_reg_' + item.id);
+                const t = document.getElementById('mb_type_' + item.id);
+                if (r) item.reg = parseInt(r.value);
+                if (t) item.type = t.value;
+            });
+
+            const configObj = { port, baud, node, map: currentModbusMap };
             localStorage.setItem('esp32_modbus_config', JSON.stringify(configObj));
             closeModbusModal();
-            log(`Modbus Config saved: ${port}, ${baud}bps, Node ${node}`);
+            log(`Modbus Config saved: Node ${node}, dynamic map synchronized`);
 
-            // Send mqtt message to ESP32 to update serial setup
+            // Send mqtt message to ESP32
             if (isConnected && client && !demoInterval) {
                 client.publish(TOPICS.control, JSON.stringify({ device: 'modbus', action: 'configure', params: configObj }));
                 log(`Sent Modbus config to device via MQTT`);

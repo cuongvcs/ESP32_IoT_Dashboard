@@ -49,13 +49,31 @@ bool teleEnabled = false;
 String teleToken = "";
 String teleChatId = "";
 bool sensorFault = false;
+bool lightFault = false;
 bool meterFault = false;
 unsigned long lastTeleAlert = 0;
+String lastTeleMessage = "";
 
 // Sensor data
 float temperature = 0;
 float humidity = 0;
 int lightLevel = 0;
+
+// ===== MODBUS DYNAMIC REGISTERS =====
+#define NUM_MODBUS_PARAMS 6
+struct ModbusParam {
+  String id;
+  uint16_t reg;
+  String type;
+};
+ModbusParam modbusMap[NUM_MODBUS_PARAMS] = {
+  {"voltage", 0, "float32"},
+  {"current", 6, "float32"},
+  {"power", 12, "float32"},
+  {"energy", 342, "float32"},
+  {"freq", 70, "float32"},
+  {"pf", 30, "float32"}
+};
 
 // Meter data (Modbus)
 float meterVoltage = 0;
@@ -130,17 +148,30 @@ void postTransmission() {
   digitalWrite(RS485_DE_RE_PIN, LOW);   // Enable receive
 }
 
-// ===== READ FLOAT FROM MODBUS (2 registers = 32-bit float) =====
-float readModbusFloat(uint16_t reg) {
-  uint8_t result = modbus.readInputRegisters(reg, 2);
-  if (result == modbus.ku8MBSuccess) {
-    // Combine 2 x 16-bit registers into 1 x 32-bit float (big-endian)
-    uint32_t raw = ((uint32_t)modbus.getResponseBuffer(0) << 16) | modbus.getResponseBuffer(1);
-    float value;
-    memcpy(&value, &raw, sizeof(value));
-    return value;
+// ===== READ DYNAMIC MODBUS REGISTER =====
+float readDynamicModbus(uint16_t reg, String type) {
+  if (type == "int16") {
+    if (modbus.readInputRegisters(reg, 1) == modbus.ku8MBSuccess) {
+      int16_t val = (int16_t)modbus.getResponseBuffer(0);
+      return (float)val;
+    }
+  } 
+  else if (type == "int32") {
+    if (modbus.readInputRegisters(reg, 2) == modbus.ku8MBSuccess) {
+      // Big-endian default (AB CD)
+      int32_t val = ((int32_t)modbus.getResponseBuffer(0) << 16) | modbus.getResponseBuffer(1);
+      return (float)val;
+    }
   }
-  return -1;  // Error
+  else { // "float32"
+    if (modbus.readInputRegisters(reg, 2) == modbus.ku8MBSuccess) {
+      uint32_t raw = ((uint32_t)modbus.getResponseBuffer(0) << 16) | modbus.getResponseBuffer(1);
+      float value;
+      memcpy(&value, &raw, sizeof(value));
+      return value;
+    }
+  }
+  return -1.0;  // Error indicator
 }
 
 // ===== SETUP WIFI =====
@@ -202,12 +233,16 @@ void setupWiFi() {
 void sendTelegram(String message) {
   if (!teleEnabled || teleToken == "" || teleChatId == "") return;
 
-  // Prevent spamming (only 1 message every 3 minutes unless it's an OK message)
+  // Prevent spamming (only 1 message every 3 minutes unless it's an OK message, 
+  // Nhung cho phep gui cac tin nhan khac nhau)
   unsigned long now = millis();
-  if (message.indexOf("ALARM") != -1 && (now - lastTeleAlert < 180000)) {
-     if (lastTeleAlert != 0) return; // Spam prevention 
+  if (message.indexOf("ALARM") != -1) {
+     if (message == lastTeleMessage && (now - lastTeleAlert < 180000)) {
+        if (lastTeleAlert != 0) return; // Spam prevention for the SAME issue
+     }
+     lastTeleMessage = message;
+     lastTeleAlert = now;
   }
-  if (message.indexOf("ALARM") != -1) lastTeleAlert = now;
 
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
@@ -245,14 +280,22 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       // 1. Output setup array config (from dashboard output config modal)
       if (strcmp(device, "outputs_setup") == 0 && strcmp(action, "configure") == 0) {
         JsonArray params = doc["params"].as<JsonArray>();
+        preferences.begin("outputs", false);
         for (int i=0; i < params.size() && i < NUM_OUTPUTS; i++) {
           outputs[i].id = params[i]["id"].as<String>();
           outputs[i].pin = params[i]["pin"].as<int>();
           outputs[i].enabled = params[i]["enabled"].as<bool>();
+          
+          String base = "out_" + String(i);
+          preferences.putString((base + "_id").c_str(), outputs[i].id);
+          preferences.putInt((base + "_pin").c_str(), outputs[i].pin);
+          preferences.putBool((base + "_en").c_str(), outputs[i].enabled);
         }
+        preferences.end();
+        
         updateOutputPins(); // run pinMode
         publishStatus();
-        Serial.println("Outputs Setup configured dynamically.");
+        Serial.println("Outputs Setup configured dynamically and saved to NVS.");
         return;
       }
       
@@ -272,7 +315,34 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
         return;
       }
 
-      // 3. Command to trigger toggles (relay, led, out3, out4, etc)
+      // 3. Modbus Config
+      if (strcmp(device, "modbus") == 0 && strcmp(action, "configure") == 0) {
+        // Doc cac thong so co ban nhu port, baudrate (da support tu truoc) thi nam trong doc["params"]["node"]
+        int node = doc["params"]["node"] | 1;
+        // Luu vao Preferences (Co the phai khoi dong lai de nhan baudrate/serial, o day tam bo qua baud rate)
+        
+        // Map configs
+        if (doc["params"]["map"].is<JsonArray>()) {
+          JsonArray mapArray = doc["params"]["map"].as<JsonArray>();
+          preferences.begin("modbus", false);
+          for (int i=0; i < mapArray.size() && i < NUM_MODBUS_PARAMS; i++) {
+             modbusMap[i].id = mapArray[i]["id"].as<String>();
+             modbusMap[i].reg = mapArray[i]["reg"].as<int>();
+             modbusMap[i].type = mapArray[i]["type"].as<String>();
+             
+             String base = "mb_" + String(i);
+             preferences.putString((base + "_id").c_str(), modbusMap[i].id);
+             preferences.putInt((base + "_reg").c_str(), modbusMap[i].reg);
+             preferences.putString((base + "_ty").c_str(), modbusMap[i].type);
+          }
+          preferences.end();
+          Serial.println("Modbus Register Map configured dynamically and saved to NVS.");
+          sendTelegram("✅ Cấu hình Bản đồ Thanh ghi Modbus (Dynamic Register Map) đã lưu thành công!");
+        }
+        return;
+      }
+
+      // 4. Command to trigger toggles (relay, led, out3, out4, etc)
       bool found = false;
       for (int i = 0; i < NUM_OUTPUTS; i++) {
         if (outputs[i].enabled && outputs[i].id == String(device)) {
@@ -379,11 +449,11 @@ void readSensors() {
   float currentHum = dht.readHumidity();
   lightLevel = analogRead(LDR_PIN);
 
-  // Fault Detection
+  // Fault Detection - DHT (Temp & Hum)
   if (isnan(currentTemp) || isnan(currentHum)) {
     if (!sensorFault) {
       Serial.println("DHT Sensor failed!");
-      sendTelegram("⚠️ ALARM: Cảm biến DHT22 đã mất kết nối hoặc bị hỏng!");
+      sendTelegram("⚠️ ALARM: Cảm biến DHT22 (Temp & Hum) đã mất kết nối hoặc bị hỏng!");
       sensorFault = true;
     }
     temperature = 0; humidity = 0; // fallback ui
@@ -393,6 +463,22 @@ void readSensors() {
     if (sensorFault) {
       sendTelegram("✅ OK: Cảm biến DHT22 đã hoạt động trở lại bình thường.");
       sensorFault = false;
+      lastTeleMessage = ""; // Reset de co the gui alarm moi neu can
+    }
+  }
+
+  // Fault Detection - LDR (Light)
+  // Neu mat ket noi hoan toan hoac chap pin, thuong analogRead cho 0 hoac = 4095 giat lien tuc
+  if (lightLevel <= 0 || lightLevel >= 4095) {
+    if (!lightFault) {
+      sendTelegram("⚠️ ALARM: Cảm biến Ánh Sáng (LDR) bị đứt dây hoặc chập mạch!");
+      lightFault = true;
+    }
+  } else {
+    if (lightFault) {
+      sendTelegram("✅ OK: Cảm biến Ánh Sáng (LDR) đã khôi phục tín hiệu.");
+      lightFault = false;
+      lastTeleMessage = "";
     }
   }
 
@@ -401,9 +487,20 @@ void readSensors() {
 
 // ===== READ POWER METER VIA MODBUS RTU =====
 void readMeter() {
-  float newV = readModbusFloat(REG_VOLTAGE);
-  
-  if (newV < 0) {
+  float vals[NUM_MODBUS_PARAMS] = {0};
+  bool timeout = false;
+
+  for (int i=0; i<NUM_MODBUS_PARAMS; i++) {
+    float v = readDynamicModbus(modbusMap[i].reg, modbusMap[i].type);
+    if (v < 0) {
+       timeout = true; 
+       break; 
+    }
+    vals[i] = v;
+    delay(50); // Delay giua cac lenh doc khong dong ho bi ngheng
+  }
+
+  if (timeout) {
     if (!meterFault) {
       Serial.println("Modbus Meter reading timeout!");
       sendTelegram("⚠️ ALARM: Mất kết nối Modbus RTU tới Đồng hồ điện!");
@@ -412,16 +509,20 @@ void readMeter() {
     meterVoltage = 0; meterCurrent = 0; meterPower = 0;
     meterEnergy = 0; meterFrequency = 0; meterPF = 0;
   } else {
-    meterVoltage = newV;
-    delay(50); meterCurrent = readModbusFloat(REG_CURRENT);
-    delay(50); meterPower = readModbusFloat(REG_POWER);
-    delay(50); meterEnergy = readModbusFloat(REG_ENERGY);
-    delay(50); meterFrequency = readModbusFloat(REG_FREQUENCY);
-    delay(50); meterPF = readModbusFloat(REG_PF);
+    // Map theo dungs ID luu
+    for (int i=0; i<NUM_MODBUS_PARAMS; i++) {
+       if (modbusMap[i].id == "voltage") meterVoltage = vals[i];
+       else if (modbusMap[i].id == "current") meterCurrent = vals[i];
+       else if (modbusMap[i].id == "power") meterPower = vals[i];
+       else if (modbusMap[i].id == "energy") meterEnergy = vals[i];
+       else if (modbusMap[i].id == "freq") meterFrequency = vals[i];
+       else if (modbusMap[i].id == "pf") meterPF = vals[i];
+    }
     
     if (meterFault) {
       sendTelegram("✅ OK: Quá trình đọc dữ liệu Modbus Đồng hồ điện đã khôi phục.");
       meterFault = false;
+      lastTeleMessage = "";
     }
   }
 
@@ -450,6 +551,29 @@ void setup() {
   teleChatId = preferences.getString("chatId", "");
   preferences.end();
   
+  // Load Output configs from NVS
+  preferences.begin("outputs", true);
+  for (int i=0; i < NUM_OUTPUTS; i++) {
+    String base = "out_" + String(i);
+    outputs[i].id = preferences.getString((base + "_id").c_str(), outputs[i].id);
+    outputs[i].pin = preferences.getInt((base + "_pin").c_str(), outputs[i].pin);
+    outputs[i].enabled = preferences.getBool((base + "_en").c_str(), outputs[i].enabled);
+  }
+  preferences.end();
+  
+  // Load Modbus configs from NVS
+  preferences.begin("modbus", true);
+  for (int i=0; i < NUM_MODBUS_PARAMS; i++) {
+    String base = "mb_" + String(i);
+    modbusMap[i].id = preferences.getString((base + "_id").c_str(), modbusMap[i].id);
+    // getInt will return 0 if key not found, so we check if key exists or just fallback safely
+    if (preferences.isKey((base + "_reg").c_str())) {
+      modbusMap[i].reg = preferences.getInt((base + "_reg").c_str(), modbusMap[i].reg);
+      modbusMap[i].type = preferences.getString((base + "_ty").c_str(), modbusMap[i].type);
+    }
+  }
+  preferences.end();
+
   // Output Pins init
   updateOutputPins();
 
@@ -472,7 +596,7 @@ void setup() {
   espClient.setInsecure(); // Skip cert verification for simplicity
   mqtt.setServer(MQTT_BROKER, MQTT_PORT);
   mqtt.setCallback(mqttCallback);
-  mqtt.setBufferSize(512);
+  mqtt.setBufferSize(2048); // MUST be > 512 to receive outputs_setup JSON array!
 
   Serial.println("Setup complete! Starting main loop...\n");
 }
